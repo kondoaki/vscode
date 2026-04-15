@@ -215,6 +215,31 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 
 		selectedModel = this._applyVisionFallback(chatRequest, selectedModel, token.available_models, knownEndpoints);
 
+		// Emit the final model selection alongside the router's recommendation
+		// so analysts can detect overrides without fragile telemetry joins
+		if (!skipRouter && routerResult.candidateModel) {
+			/* __GDPR__
+				"automode.routerModelSelection" : {
+					"owner": "aashnagarg",
+					"comment": "Reports the router's recommended model vs the actual model used after all client-side overrides (same-provider, vision fallback, default selection)",
+					"conversationId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The conversation ID" },
+					"candidateModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The router's top candidate model (candidate_models[0])" },
+					"actualModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model actually selected after all client-side overrides" },
+					"overrideReason": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Why the actual model differs from the candidate: none, visionFallback, defaultFallback, or sameProvider" }
+				}
+			*/
+			const candidateModel = routerResult.candidateModel;
+			const overrideReason = candidateModel === selectedModel.model ? 'none'
+				: routerFallbackReason ? 'defaultFallback'
+				: 'clientOverride';
+			this._telemetryService.sendMSFTTelemetryEvent('automode.routerModelSelection', {
+				conversationId: conversationId ?? '',
+				candidateModel,
+				actualModel: selectedModel.model,
+				overrideReason,
+			});
+		}
+
 		// Reuse the cached endpoint if the session token and model haven't changed
 		const autoEndpoint = (entry?.endpoint && entry.lastSessionToken === token.session_token && entry.endpoint.model === selectedModel.model)
 			? entry.endpoint
@@ -250,7 +275,7 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 		entry: AutoModelCacheEntry | undefined,
 		token: AutoModeAPIResponse,
 		knownEndpoints: IChatEndpoint[],
-	): Promise<{ selectedModel?: IChatEndpoint; lastRoutedPrompt?: string; fallbackReason?: string }> {
+	): Promise<{ selectedModel?: IChatEndpoint; lastRoutedPrompt?: string; fallbackReason?: string; candidateModel?: string }> {
 		const prompt = chatRequest?.prompt?.trim();
 		const lastRoutedPrompt = entry?.lastRoutedPrompt ?? prompt;
 
@@ -298,7 +323,7 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 			if (result.sticky_override) {
 				this._logService.trace(`[AutomodeService] Sticky routing override: confidence=${(result.confidence * 100).toFixed(1)}%, label=${result.predicted_label}, router_model=${result.candidate_models[0]}, actual_model=${selectedModel.model}`);
 			}
-			return { selectedModel, lastRoutedPrompt: prompt };
+			return { selectedModel, lastRoutedPrompt: prompt, candidateModel: result.candidate_models[0] };
 		} catch (e) {
 			const isTimeout = isAbortError(e);
 			let fallbackReason: string;

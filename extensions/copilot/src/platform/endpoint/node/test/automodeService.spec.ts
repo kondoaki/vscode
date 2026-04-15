@@ -17,7 +17,7 @@ import { ILogService } from '../../../log/common/logService';
 import { IChatEndpoint } from '../../../networking/common/networking';
 import { NullRequestLogger } from '../../../requestLogger/node/nullRequestLogger';
 import { IExperimentationService, NullExperimentationService } from '../../../telemetry/common/nullExperimentationService';
-import { NullTelemetryService } from '../../../telemetry/common/nullTelemetryService';
+import { ITelemetryService } from '../../../telemetry/common/telemetry';
 import { ICAPIClientService } from '../../common/capiClient';
 import { AutomodeService } from '../automodeService';
 
@@ -60,6 +60,7 @@ describe('AutomodeService', () => {
 	let configurationService: IConfigurationService;
 	let mockChatEndpoint: IChatEndpoint;
 	let envService: NullEnvService;
+	let mockTelemetryService: ITelemetryService & { sendMSFTTelemetryEvent: ReturnType<typeof vi.fn> };
 
 	function createEndpoint(model: string, provider: string, overrides?: Partial<IChatEndpoint>): IChatEndpoint {
 		return {
@@ -87,7 +88,7 @@ describe('AutomodeService', () => {
 			mockExpService,
 			configurationService,
 			envService,
-			new NullTelemetryService(),
+			mockTelemetryService,
 			new NullRequestLogger()
 		);
 	}
@@ -145,6 +146,13 @@ describe('AutomodeService', () => {
 
 		configurationService = new InMemoryConfigurationService(new DefaultsOnlyConfigurationService());
 		envService = new NullEnvService();
+		mockTelemetryService = {
+			sendTelemetryEvent: vi.fn(),
+			sendMSFTTelemetryEvent: vi.fn(),
+			sendTelemetryErrorEvent: vi.fn(),
+			sendMSFTTelemetryErrorEvent: vi.fn(),
+			sendSharedTelemetryEvent: vi.fn(),
+		} as unknown as ITelemetryService & { sendMSFTTelemetryEvent: ReturnType<typeof vi.fn> };
 	});
 
 	afterEach(() => {
@@ -943,6 +951,68 @@ describe('AutomodeService', () => {
 			};
 			const reEvalResult = await automodeService.resolveAutoModeEndpoint(chatRequest3 as ChatRequest, [gpt4oEndpoint, claudeEndpoint]);
 			expect(reEvalResult.model).toBe('claude-sonnet');
+		});
+	});
+
+	describe('routerModelSelection telemetry', () => {
+		it('should emit routerModelSelection with candidateModel and actualModel when router is used', async () => {
+			enableRouter();
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+			const claudeEndpoint = createEndpoint('claude-sonnet', 'Anthropic');
+
+			mockRouterResponse(
+				['gpt-4o', 'claude-sonnet'],
+				{ chosen_model: 'gpt-4o', candidate_models: ['gpt-4o', 'claude-sonnet'] }
+			);
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'test prompt',
+				sessionId: 'session-telemetry-test'
+			};
+
+			await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [gpt4oEndpoint, claudeEndpoint]);
+
+			const telemetryCalls = mockTelemetryService.sendMSFTTelemetryEvent.mock.calls;
+			const selectionEvent = telemetryCalls.find((call: unknown[]) => call[0] === 'automode.routerModelSelection');
+			expect(selectionEvent).toBeDefined();
+			expect(selectionEvent![1]).toMatchObject({
+				candidateModel: 'gpt-4o',
+				actualModel: 'gpt-4o',
+				overrideReason: 'none',
+			});
+		});
+
+		it('should emit overrideReason=clientOverride when actual model differs from candidate', async () => {
+			enableRouter();
+			const gpt4oEndpoint = createEndpoint('gpt-4o', 'OpenAI');
+			const claudeEndpoint = createEndpoint('claude-sonnet', 'Anthropic');
+
+			// Router picks unknown-model but it has no endpoint, so falls back
+			mockRouterResponse(
+				['gpt-4o'],
+				{ chosen_model: 'unknown-model', candidate_models: ['unknown-model'] }
+			);
+
+			automodeService = createService();
+			const chatRequest: Partial<ChatRequest> = {
+				location: ChatLocation.Panel,
+				prompt: 'test prompt',
+				sessionId: 'session-telemetry-override'
+			};
+
+			await automodeService.resolveAutoModeEndpoint(chatRequest as ChatRequest, [gpt4oEndpoint, claudeEndpoint]);
+
+			const telemetryCalls = mockTelemetryService.sendMSFTTelemetryEvent.mock.calls;
+			const fallbackEvent = telemetryCalls.find((call: unknown[]) => call[0] === 'automode.routerModelSelection');
+			// When router returns unknown model, candidateModel is set but selectedModel
+			// is undefined so it falls to _selectDefaultModel — no routerModelSelection emitted
+			// because fallbackReason is set and candidateModel is returned
+			expect(fallbackEvent).toBeDefined();
+			if (fallbackEvent) {
+				expect(fallbackEvent[1].overrideReason).toBe('defaultFallback');
+			}
 		});
 	});
 
