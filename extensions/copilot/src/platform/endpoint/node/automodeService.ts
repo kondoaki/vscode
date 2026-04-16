@@ -225,19 +225,25 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 					"conversationId": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The conversation ID" },
 					"candidateModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The router's top candidate model (candidate_models[0])" },
 					"actualModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model actually selected after all client-side overrides" },
-					"overrideReason": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Why the actual model differs from the candidate: none, visionFallback, defaultFallback, or sameProvider" }
+					"overrideReason": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Why the actual model differs from the candidate: none, visionFallback, defaultFallback, or sameProvider" },
+					"filteredModelCount": { "classification": "SystemMetaData", "purpose": "PerformanceAndHealth", "isMeasurement": true, "comment": "Number of available_models filtered out because they had no matching knownEndpoint (CAPI sync gap indicator)" }
 				}
 			*/
 			const candidateModel = routerResult.candidateModel;
 			const overrideReason = candidateModel === selectedModel.model ? 'none'
 				: routerFallbackReason ? 'defaultFallback'
 				: 'clientOverride';
-			this._telemetryService.sendMSFTTelemetryEvent('automode.routerModelSelection', {
-				conversationId: conversationId ?? '',
-				candidateModel,
-				actualModel: selectedModel.model,
-				overrideReason,
-			});
+			this._telemetryService.sendMSFTTelemetryEvent('automode.routerModelSelection',
+				{
+					conversationId: conversationId ?? '',
+					candidateModel,
+					actualModel: selectedModel.model,
+					overrideReason,
+				},
+				{
+					filteredModelCount: routerResult.filteredModelCount ?? 0,
+				}
+			);
 		}
 
 		// Reuse the cached endpoint if the session token and model haven't changed
@@ -275,7 +281,7 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 		entry: AutoModelCacheEntry | undefined,
 		token: AutoModeAPIResponse,
 		knownEndpoints: IChatEndpoint[],
-	): Promise<{ selectedModel?: IChatEndpoint; lastRoutedPrompt?: string; fallbackReason?: string; candidateModel?: string }> {
+	): Promise<{ selectedModel?: IChatEndpoint; lastRoutedPrompt?: string; fallbackReason?: string; candidateModel?: string; filteredModelCount?: number }> {
 		const prompt = chatRequest?.prompt?.trim();
 		const lastRoutedPrompt = entry?.lastRoutedPrompt ?? prompt;
 
@@ -301,7 +307,25 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 				turn_number: (entry?.turnCount ?? 0) + 1,
 			};
 			const routingMethod = this._configurationService.getExperimentBasedConfig(ConfigKey.TeamInternal.AutoModeRoutingMethod, this._expService) || undefined;
-			const result = await this._routerDecisionFetcher.getRouterDecision(prompt, token.session_token, token.available_models, undefined, contextSignals, conversationId, chatRequest?.id, routingMethod, hasImage(chatRequest));
+
+			// Filter available_models to only those the client can actually serve.
+			// The AutoModels API and Models API are separate CAPI calls that can be
+			// out of sync (e.g. a new model appears in available_models before the
+			// Models API returns it). Sending unresolvable models to the router
+			// causes it to recommend models the client must silently discard.
+			const knownModelIds = new Set(knownEndpoints.map(e => e.model));
+			const routableModels = token.available_models.filter(m => knownModelIds.has(m));
+			const filteredModelCount = token.available_models.length - routableModels.length;
+			if (!routableModels.length) {
+				this._logService.warn(`[AutomodeService] No available_models matched knownEndpoints. available_models=[${token.available_models.join(', ')}], knownEndpoints=[${knownEndpoints.map(e => e.model).join(', ')}]`);
+				return { lastRoutedPrompt: prompt, fallbackReason: 'noMatchingEndpoint', filteredModelCount };
+			}
+			if (filteredModelCount > 0) {
+				const dropped = token.available_models.filter(m => !knownModelIds.has(m));
+				this._logService.info(`[AutomodeService] Filtered ${dropped.length} unresolvable model(s) before routing: [${dropped.join(', ')}]`);
+			}
+
+			const result = await this._routerDecisionFetcher.getRouterDecision(prompt, token.session_token, routableModels, undefined, contextSignals, conversationId, chatRequest?.id, routingMethod, hasImage(chatRequest));
 
 			if (result.fallback) {
 				this._logService.info(`[AutomodeService] Router signaled fallback: ${result.fallback_reason ?? 'unknown'}, routing_method=${result.routing_method ?? 'n/a'}`);
@@ -312,18 +336,22 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 				return { lastRoutedPrompt: prompt, fallbackReason: 'emptyCandidateList' };
 			}
 
-			// Prefer same-provider model, then fall back to the router's top candidate
-			const selectedModel = (entry?.endpoint && this._findSameProviderModel(entry.endpoint.modelProvider, result.candidate_models, knownEndpoints))
-				?? knownEndpoints.find(e => e.model === result.candidate_models[0]);
+			// Trust the router's ranked candidate list directly.
+			// Same-provider preference is intentionally NOT applied here — the router
+			// already accounts for available models and re-runs after /compact, so
+			// overriding its pick with same-provider negates cost-saving decisions.
+			// Same-provider is still used in _selectDefaultModel (the non-router fallback).
+			const selectedModel = this._findFirstAvailableModel(result.candidate_models, knownEndpoints);
 
 			if (!selectedModel) {
+				this._logService.warn(`[AutomodeService] None of the router's candidate_models matched knownEndpoints: [${result.candidate_models.join(', ')}]`);
 				return { lastRoutedPrompt: prompt, fallbackReason: 'noMatchingEndpoint' };
 			}
 
 			if (result.sticky_override) {
 				this._logService.trace(`[AutomodeService] Sticky routing override: confidence=${(result.confidence * 100).toFixed(1)}%, label=${result.predicted_label}, router_model=${result.candidate_models[0]}, actual_model=${selectedModel.model}`);
 			}
-			return { selectedModel, lastRoutedPrompt: prompt, candidateModel: result.candidate_models[0] };
+			return { selectedModel, lastRoutedPrompt: prompt, candidateModel: result.candidate_models[0], filteredModelCount };
 		} catch (e) {
 			const isTimeout = isAbortError(e);
 			let fallbackReason: string;
