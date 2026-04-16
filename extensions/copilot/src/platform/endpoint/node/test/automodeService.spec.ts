@@ -1202,6 +1202,7 @@ describe('AutomodeService', () => {
 			expect(selectionEvent![1].candidateModel).toBe('gpt-4o');
 			expect(selectionEvent![1].actualModel).toBe('gpt-4o');
 			expect(selectionEvent![1].overrideReason).toBe('none');
+			expect(selectionEvent![1].droppedModels).toBe('claude-haiku-4.5');
 			expect(selectionEvent![2].filteredModelCount).toBe(1);
 		});
 	});

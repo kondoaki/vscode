@@ -226,7 +226,8 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 					"candidateModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The router's top candidate model (candidate_models[0])" },
 					"actualModel": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "The model actually selected after all client-side overrides" },
 					"overrideReason": { "classification": "SystemMetaData", "purpose": "FeatureInsight", "comment": "Why the actual model differs from the candidate: none, defaultFallback, or clientOverride" },
-					"filteredModelCount": { "classification": "SystemMetaData", "purpose": "PerformanceAndHealth", "isMeasurement": true, "comment": "Number of available_models filtered out because they had no matching knownEndpoint (CAPI sync gap indicator)" }
+					"filteredModelCount": { "classification": "SystemMetaData", "purpose": "PerformanceAndHealth", "isMeasurement": true, "comment": "Number of available_models filtered out because they had no matching knownEndpoint (CAPI sync gap indicator)" },
+					"droppedModels": { "classification": "SystemMetaData", "purpose": "PerformanceAndHealth", "comment": "Comma-separated list of model IDs filtered out before routing because they had no matching knownEndpoint" }
 				}
 			*/
 			const candidateModel = routerResult.candidateModel;
@@ -239,6 +240,7 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 					candidateModel,
 					actualModel: selectedModel.model,
 					overrideReason,
+					droppedModels: routerResult.droppedModels ?? '',
 				},
 				{
 					filteredModelCount: routerResult.filteredModelCount ?? 0,
@@ -281,7 +283,7 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 		entry: AutoModelCacheEntry | undefined,
 		token: AutoModeAPIResponse,
 		knownEndpoints: IChatEndpoint[],
-	): Promise<{ selectedModel?: IChatEndpoint; lastRoutedPrompt?: string; fallbackReason?: string; candidateModel?: string; filteredModelCount?: number }> {
+	): Promise<{ selectedModel?: IChatEndpoint; lastRoutedPrompt?: string; fallbackReason?: string; candidateModel?: string; filteredModelCount?: number; droppedModels?: string }> {
 		const prompt = chatRequest?.prompt?.trim();
 		const lastRoutedPrompt = entry?.lastRoutedPrompt ?? prompt;
 
@@ -316,12 +318,13 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 			const knownModelIds = new Set(knownEndpoints.map(e => e.model));
 			const routableModels = token.available_models.filter(m => knownModelIds.has(m));
 			const filteredModelCount = token.available_models.length - routableModels.length;
+			const droppedModels = filteredModelCount > 0 ? token.available_models.filter(m => !knownModelIds.has(m)).join(',') : undefined;
 			if (!routableModels.length) {
 				this._logService.warn(`[AutomodeService] No available_models matched knownEndpoints. available_models=[${token.available_models.join(', ')}], knownEndpoints=[${knownEndpoints.map(e => e.model).join(', ')}]`);
-				return { lastRoutedPrompt: prompt, fallbackReason: 'noMatchingEndpoint', filteredModelCount };
+				return { lastRoutedPrompt: prompt, fallbackReason: 'noMatchingEndpoint', filteredModelCount, droppedModels };
 			}
-			if (filteredModelCount > 0) {
-				this._logService.info(`[AutomodeService] Filtered ${filteredModelCount} unresolvable model(s) before routing: [${token.available_models.filter(m => !knownModelIds.has(m)).join(', ')}]`);
+			if (droppedModels) {
+				this._logService.info(`[AutomodeService] Filtered ${filteredModelCount} unresolvable model(s) before routing: [${droppedModels}]`);
 			}
 
 			const result = await this._routerDecisionFetcher.getRouterDecision(prompt, token.session_token, routableModels, undefined, contextSignals, conversationId, chatRequest?.id, routingMethod, hasImage(chatRequest));
@@ -344,13 +347,13 @@ export class AutomodeService extends Disposable implements IAutomodeService {
 
 			if (!selectedModel) {
 				this._logService.warn(`[AutomodeService] None of the router's candidate_models matched knownEndpoints: [${result.candidate_models.join(', ')}]`);
-				return { lastRoutedPrompt: prompt, fallbackReason: 'noMatchingEndpoint', filteredModelCount };
+				return { lastRoutedPrompt: prompt, fallbackReason: 'noMatchingEndpoint', filteredModelCount, droppedModels };
 			}
 
 			if (result.sticky_override) {
 				this._logService.trace(`[AutomodeService] Sticky routing override: confidence=${(result.confidence * 100).toFixed(1)}%, label=${result.predicted_label}, router_model=${result.candidate_models[0]}, actual_model=${selectedModel.model}`);
 			}
-			return { selectedModel, lastRoutedPrompt: prompt, candidateModel: result.candidate_models[0], filteredModelCount };
+			return { selectedModel, lastRoutedPrompt: prompt, candidateModel: result.candidate_models[0], filteredModelCount, droppedModels };
 		} catch (e) {
 			const isTimeout = isAbortError(e);
 			let fallbackReason: string;
